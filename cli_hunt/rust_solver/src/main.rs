@@ -24,25 +24,13 @@ struct Args {
     no_pre_mine_hour: String,
 }
 
-pub fn hash_structure_good(hash: &[u8], zero_bits: usize) -> bool {
-    let full_bytes = zero_bits / 8; // Number of full zero bytes
-    let remaining_bits = zero_bits % 8; // Bits to check in the next byte
-
-    // Check full zero bytes
-    if hash.len() < full_bytes || hash[..full_bytes].iter().any(|&b| b != 0) {
-        return false;
+pub fn hash_structure_good(hash: &[u8], difficulty_mask: u32) -> bool {
+    if hash.len() < 4 {
+        return false; // Not enough bytes to apply a u32 mask
     }
 
-    if remaining_bits == 0 {
-        return true;
-    }
-    if hash.len() > full_bytes {
-        // Mask for the most significant bits
-        let mask = 0xFF << (8 - remaining_bits);
-        hash[full_bytes] & mask == 0
-    } else {
-        false
-    }
+    let hash_prefix = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    (hash_prefix & difficulty_mask) == 0
 }
 
 pub fn init_rom(no_pre_mine_hex: &str) -> Rom {
@@ -65,12 +53,8 @@ fn main() {
 
     let mut nonce: u64 = 0; // Start with a random nonce or 0
 
-    // Parse difficulty from hex string to number of zero bits
-    let difficulty_bytes = hex::decode(&args.difficulty).unwrap();
-    let mut leading_zeros_required = 0;
-    for byte in difficulty_bytes {
-        leading_zeros_required += byte.leading_zeros();
-    }
+    // Parse difficulty from hex string to u32 mask
+    let difficulty_mask = u32::from_str_radix(&args.difficulty, 16).unwrap();
 
     loop {
         let preimage = format!(
@@ -86,7 +70,7 @@ fn main() {
 
         let hash_result = hash(&preimage.as_bytes(), &rom, 8, 256);
 
-        if hash_structure_good(&hash_result, leading_zeros_required as usize) {
+        if hash_structure_good(&hash_result, difficulty_mask) {
             println!("{:016x}", nonce);
             break;
         }

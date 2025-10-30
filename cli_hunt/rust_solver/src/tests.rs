@@ -34,17 +34,12 @@ mod tests {
         let hash_result = hash(&preimage.as_bytes(), &rom, 8, 256);
         println!("DEBUG: Hash result: {:?}", hash_result);
 
-        // Calculate required leading zeros from difficulty string
-        let difficulty_bytes = hex::decode(difficulty_str).unwrap();
-        let mut leading_zeros_required = 0;
-        for byte in difficulty_bytes {
-            leading_zeros_required += byte.leading_zeros();
-        }
-        println!("DEBUG: Leading zeros required: {}", leading_zeros_required);
+        // Parse difficulty from hex string to u32 mask
+        let difficulty_mask = u32::from_str_radix(difficulty_str, 16).unwrap();
 
         // Validate the hash against the difficulty
         assert!(
-            hash_structure_good(&hash_result, leading_zeros_required as usize),
+            hash_structure_good(&hash_result, difficulty_mask),
             "Hash does not meet difficulty requirements"
         );
     }
