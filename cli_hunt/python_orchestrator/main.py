@@ -434,9 +434,11 @@ def init_db(json_files):
                     continue
 
                 if address not in db:
+                    challenge_queue = data.get("challenge_queue", [])
+                    challenge_queue.sort(key=lambda c: c["challengeId"])
                     db[address] = {
                         "registration_receipt": data.get("registration_receipt"),
-                        "challenge_queue": data.get("challenge_queue", []),
+                        "challenge_queue": challenge_queue,
                     }
                     logging.info(f"Initialized new address: {address}")
                 else:
