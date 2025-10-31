@@ -266,10 +266,35 @@ def solver_worker(db_manager, stop_event, interval, tui_app):
                             "--no-pre-mine-hour",
                             c["noPreMineHour"],
                         ]
-                        result = subprocess.run(
-                            command, capture_output=True, text=True, check=True
+                        process = subprocess.Popen(
+                            command,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
                         )
-                        nonce = result.stdout.strip()
+
+                        while process.poll() is None:
+                            if stop_event.is_set():
+                                process.terminate()
+                                tui_app.post_message(
+                                    LogMessage(
+                                        f"Solver for {c['challengeId']} terminated by shutdown."
+                                    )
+                                )
+                                return  # Exit worker thread
+                            stop_event.wait(0.2)  # Non-blocking wait
+
+                        stdout, stderr = process.communicate()
+
+                        if process.returncode != 0:
+                            raise subprocess.CalledProcessError(
+                                process.returncode,
+                                command,
+                                output=stdout,
+                                stderr=stderr,
+                            )
+
+                        nonce = stdout.strip()
                         solved_time = datetime.now(timezone.utc)
                         tui_app.post_message(
                             LogMessage(f"Found nonce: {nonce} for {c['challengeId']}")
