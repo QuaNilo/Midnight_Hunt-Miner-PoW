@@ -30,44 +30,53 @@ def load_db():
 
 
 def init_db(json_files):
-    """Initializes the database from a list of JSON files."""
-    print("Initializing database...")
-    db = {}
+    print("Updating database from registration receipts...")
+    db = load_db()
     for file_path in json_files:
+        if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
+            continue
         try:
             with open(file_path, "r") as f:
                 data = json.load(f)
-                if (
-                    "registration_receipt" in data
-                    and "walletAddress" in data["registration_receipt"]
-                ):
-                    address = data["registration_receipt"]["walletAddress"]
-                    db[address] = {
-                        "registration_receipt": data["registration_receipt"],
-                        "challenge_queue": data.get("challenge_queue", []),
-                    }
-                    print(f"Added address {address} from {file_path}")
+                address = data.get("registration_receipt", {}).get("walletAddress")
+                if address:
+                    if address not in db:
+                        db[address] = {
+                            "registration_receipt": data.get("registration_receipt"),
+                            "challenge_queue": data.get("challenge_queue", []),
+                        }
+                        print(f"Added new address: {address}")
+                    else:
+                        print(f"Updating existing address: {address}")
+                        existing_queue = db[address].get("challenge_queue", [])
+                        existing_ids = {c["challengeId"] for c in existing_queue}
+                        new_challenges_count = 0
+                        for challenge in data.get("challenge_queue", []):
+                            if challenge["challengeId"] not in existing_ids:
+                                existing_queue.append(challenge)
+                                new_challenges_count += 1
+
+                        if new_challenges_count > 0:
+                            existing_queue.sort(key=lambda c: c["challengeId"])
+                            db[address]["challenge_queue"] = existing_queue
+                            print(f"  Added {new_challenges_count} new challenges.")
+                        else:
+                            print("  No new challenges to add.")
                 else:
-                    print(
-                        f"Warning: Could not find registration_receipt and walletAddress in {file_path}. Skipping."
-                    )
-        except FileNotFoundError:
-            print(f"Error: File not found: {file_path}")
+                    print(f"Could not find address in {file_path}")
         except json.JSONDecodeError:
-            print(f"Error: Could not decode JSON from {file_path}")
+            print(f"Error decoding JSON from {file_path}. Skipping.")
+        except Exception as e:
+            print(f"An unexpected error occurred with {file_path}: {e}")
+
     save_db(db)
-    print("Database initialized.")
+    print("Database update complete.")
 
 
-def fetch_challenges():
+def fetch_challenges(addresses):
     print("Fetching challenges...")
     db = load_db()
-    addresses = list(db.keys())
-
-    if not addresses:
-        print("No addresses found in the database. Run 'init' first.")
-        return
-
     for address in addresses:
         try:
             response = requests.get("https://sm.midnight.gd/api/challenge")
@@ -86,26 +95,26 @@ def fetch_challenges():
                 "availableAt": challenge_data["issued_at"],
             }
 
-            # This case should ideally not happen if init is run first
-            if address not in db:
-                db[address] = {"registration_receipt": {}, "challenge_queue": []}
-
-            challenge_queue = db[address]["challenge_queue"]
-
-            # Check if challenge already exists for this address
-            if not any(
-                c["challengeId"] == new_challenge["challengeId"]
-                for c in challenge_queue
-            ):
-                challenge_queue.append(new_challenge)
-                challenge_queue.sort(key=lambda c: c["challengeId"])
-                print(
-                    f"New challenge fetched for {address}: {new_challenge['challengeId']}"
-                )
+            if address in db:
+                challenge_queue = db[address].get("challenge_queue", [])
+                # Check if challenge already exists for this address
+                if not any(
+                    c["challengeId"] == new_challenge["challengeId"]
+                    for c in challenge_queue
+                ):
+                    challenge_queue.append(new_challenge)
+                    challenge_queue.sort(key=lambda c: c["challengeId"])
+                    db[address]["challenge_queue"] = challenge_queue
+                    print(
+                        f"New challenge fetched for {address}: {new_challenge['challengeId']}"
+                    )
+                else:
+                    print(
+                        f"Challenge {new_challenge['challengeId']} already exists for {address}"
+                    )
             else:
-                print(
-                    f"Challenge {new_challenge['challengeId']} already exists for {address}"
-                )
+                print(f"Address {address} not in database, skipping.")
+
         except requests.exceptions.RequestException as e:
             print(f"Error fetching challenge for {address}: {e}")
     save_db(db)
@@ -185,30 +194,39 @@ def solve_challenges():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Midnight Scavenger Hunt Orchestrator")
-    subparsers = parser.add_subparsers(
-        dest="command", required=True, help="Sub-command help"
+    parser = argparse.ArgumentParser(
+        description="Challenge orchestrator for Midnight scavenger hunt."
     )
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Init command
-    parser_init = subparsers.add_parser(
-        "init", help="Initialize the database from JSON files."
+    # init command
+    init_parser = subparsers.add_parser(
+        "init", help="Initialize or update the database from JSON files."
     )
-    parser_init.add_argument("files", nargs="+", help="List of JSON files to import.")
+    init_parser.add_argument("files", nargs="+", help="List of JSON files to import.")
 
-    # Fetch command
-    subparsers.add_parser("fetch", help="Fetch new challenges for all addresses.")
+    # fetch command
+    subparsers.add_parser("fetch", help="Fetch new challenges.")
 
-    # Solve command
-    subparsers.add_parser("solve", help="Attempt to solve available challenges.")
+    # solve command
+    subparsers.add_parser("solve", help="Solve available challenges.")
 
     args = parser.parse_args()
 
     if args.command == "init":
         init_db(args.files)
     elif args.command == "fetch":
-        fetch_challenges()
+        db = load_db()
+        if not db:
+            print("Database is not initialized. Please run 'init' first.")
+            return
+        addresses = list(db.keys())
+        fetch_challenges(addresses)
     elif args.command == "solve":
+        db = load_db()
+        if not db:
+            print("Database is not initialized. Please run 'init' first.")
+            return
         solve_challenges()
 
 
