@@ -4,6 +4,8 @@ This project provides a command-line interface (CLI) tool for managing and autom
 
 The tool is designed to manage multiple mining addresses and keep track of their challenge progress locally.
 
+<img width="2712" height="1904" alt="image" src="https://github.com/user-attachments/assets/552ae061-46fa-4b62-9fd7-b18b136bb33a" />
+
 ## Features
 
 *   **Automated Challenge Management**: Automatically fetches new challenges and submits solutions.
