@@ -228,7 +228,7 @@ def solver_worker(db_manager, stop_event, interval):
                         print(f"Found nonce: {nonce}")
 
                         submit_url = f"https://sm.midnight.gd/api/solution/{address}/{c['challengeId']}/{nonce}"
-                        submit_response = requests.post(submit_url, data={})
+                        submit_response = requests.post(submit_url)
                         submit_response.raise_for_status()
                         print(f"Solution submitted successfully for {c['challengeId']}")
 
