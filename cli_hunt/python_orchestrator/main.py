@@ -2,10 +2,11 @@ import argparse
 import json
 import logging
 import os
+import concurrent.futures
 import subprocess
 import threading
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from tui import ChallengeUpdate, LogMessage, OrchestratorTUI, RefreshTable
@@ -47,6 +48,7 @@ class DatabaseManager:
         self._lock = threading.Lock()
         self._load_from_disk()
         self._replay_journal()
+        self._reset_solving_challenges_on_startup()
 
     def _load_from_disk(self):
         if os.path.exists(DB_FILE):
@@ -59,6 +61,21 @@ class DatabaseManager:
                     f"Error reading {DB_FILE}, starting with an empty database."
                 )
                 self._db = {}
+
+    def _apply_add_challenge(self, address, challenge):
+        if address in self._db:
+            queue = self._db[address].get("challenge_queue", [])
+            if not any(c["challengeId"] == challenge["challengeId"] for c in queue):
+                queue.append(challenge)
+                queue.sort(key=lambda c: c["challengeId"])
+
+    def _apply_update_challenge(self, address, challenge_id, update):
+        if address in self._db:
+            queue = self._db[address].get("challenge_queue", [])
+            for c in queue:
+                if c["challengeId"] == challenge_id:
+                    c.update(update)
+                    break
 
     def _replay_journal(self):
         if not os.path.exists(JOURNAL_FILE):
@@ -86,6 +103,20 @@ class DatabaseManager:
         if replayed_count > 0:
             logging.info(f"Replayed {replayed_count} journal entries.")
 
+    def _reset_solving_challenges_on_startup(self):
+        """Resets any 'solving' challenges to 'available' at startup."""
+        reset_count = 0
+        for address, data in self._db.items():
+            queue = data.get("challenge_queue", [])
+            for c in queue:
+                if c.get("status") == "solving":
+                    c["status"] = "available"
+                    reset_count += 1
+        if reset_count > 0:
+            logging.warning(
+                f"Reset {reset_count} challenges from 'solving' to 'available' status on startup."
+            )
+
     def _log_to_journal(self, action, payload):
         try:
             with open(JOURNAL_FILE, "a") as f:
@@ -97,21 +128,6 @@ class DatabaseManager:
                 f.write(json.dumps(log_entry) + "\n")
         except IOError as e:
             logging.critical(f"CRITICAL: Could not write to journal file: {e}")
-
-    def _apply_add_challenge(self, address, challenge):
-        if address in self._db:
-            queue = self._db[address].get("challenge_queue", [])
-            if not any(c["challengeId"] == challenge["challengeId"] for c in queue):
-                queue.append(challenge)
-                queue.sort(key=lambda c: c["challengeId"])
-
-    def _apply_update_challenge(self, address, challenge_id, update):
-        if address in self._db:
-            queue = self._db[address].get("challenge_queue", [])
-            for c in queue:
-                if c["challengeId"] == challenge_id:
-                    c.update(update)
-                    break
 
     def add_challenge(self, address, challenge):
         with self._lock:
@@ -213,187 +229,265 @@ def fetcher_worker(db_manager, stop_event, tui_app):
     logging.info("Fetcher thread stopped.")
 
 
-def solver_worker(db_manager, stop_event, interval, tui_app):
+def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
+    """Solves a single challenge."""
+    c = challenge  # for brevity
+    msg = f"Attempting to solve challenge {c['challengeId']} for {address[:10]}..."
+    tui_app.post_message(LogMessage(msg))
+
+    try:
+        command = [
+            RUST_SOLVER_PATH,
+            "--address",
+            address,
+            "--challenge-id",
+            c["challengeId"],
+            "--difficulty",
+            c["difficulty"],
+            "--no-pre-mine",
+            str(c["noPreMine"]),  # Convert boolean to string for subprocess
+            "--latest-submission",
+            c["latestSubmission"],
+            "--no-pre-mine-hour",
+            str(c["noPreMineHour"]),  # Convert to string for subprocess
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        while process.poll() is None:
+            if stop_event.is_set():
+                process.terminate()
+                tui_app.post_message(
+                    LogMessage(f"Solver for {c['challengeId']} terminated by shutdown.")
+                )
+                # Revert status so it can be picked up again on restart
+                db_manager.update_challenge(
+                    address, c["challengeId"], {"status": "available"}
+                )
+                return
+            stop_event.wait(0.2)
+
+        stdout, stderr = process.communicate()
+
+        if process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode,
+                command,
+                output=stdout,
+                stderr=stderr,
+            )
+
+        nonce = stdout.strip()
+        solved_time = datetime.now(timezone.utc)
+        tui_app.post_message(LogMessage(f"Found nonce: {nonce} for {c['challengeId']}"))
+
+        submit_url = (
+            f"https://sm.midnight.gd/api/solution/{address}/{c['challengeId']}/{nonce}"
+        )
+        submit_response = requests.post(submit_url)
+        submit_response.raise_for_status()
+        validated_time = datetime.now(timezone.utc)
+        tui_app.post_message(
+            LogMessage(f"Solution submitted successfully for {c['challengeId']}")
+        )
+
+        try:
+            submission_data = submit_response.json()
+            crypto_receipt = submission_data.get("crypto_receipt")
+
+            update = {}
+            if crypto_receipt:
+                update = {
+                    "status": "validated",
+                    "solvedAt": solved_time.isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    ),
+                    "submittedAt": solved_time.isoformat(
+                        timespec="milliseconds"
+                    ).replace("+00:00", "Z"),
+                    "validatedAt": validated_time.isoformat(
+                        timespec="milliseconds"
+                    ).replace("+00:00", "Z"),
+                    "salt": nonce,
+                    "cryptoReceipt": crypto_receipt,
+                }
+                tui_app.post_message(
+                    LogMessage(f"Successfully validated challenge {c['challengeId']}")
+                )
+            else:
+                update = {
+                    "status": "solved",  # Submitted but not validated with receipt
+                    "solvedAt": solved_time.isoformat(timespec="milliseconds").replace(
+                        "+00:00", "Z"
+                    ),
+                    "salt": nonce,
+                }
+                tui_app.post_message(
+                    LogMessage(
+                        f"Submission for {c['challengeId']} OK but no crypto_receipt."
+                    )
+                )
+
+            updated_status = db_manager.update_challenge(
+                address, c["challengeId"], update
+            )
+            if updated_status:
+                tui_app.post_message(
+                    ChallengeUpdate(address, c["challengeId"], updated_status)
+                )
+
+        except json.JSONDecodeError:
+            msg = f"Failed to decode submission response for {c['challengeId']}."
+            tui_app.post_message(LogMessage(msg))
+            update = {"status": "submission_error", "salt": nonce}
+            updated_status = db_manager.update_challenge(
+                address, c["challengeId"], update
+            )
+            if updated_status:
+                tui_app.post_message(
+                    ChallengeUpdate(address, c["challengeId"], updated_status)
+                )
+
+    except subprocess.CalledProcessError as e:
+        msg = f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"
+        tui_app.post_message(LogMessage(msg))
+        # Revert status to available if solver fails
+        db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
+        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
+    except requests.exceptions.RequestException as e:  # ty: ignore
+        msg = f"Error submitting solution for {c['challengeId']}: {e}"
+        tui_app.post_message(LogMessage(msg))
+        db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
+        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
+    except Exception as e:
+        msg = f"An unexpected error occurred during solving: {e}"
+        tui_app.post_message(LogMessage(msg))
+        db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
+        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
+
+
+def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
     tui_app.post_message(
-        LogMessage(f"Solver thread started. Polling every {interval / 60:.1f} minutes.")
+        LogMessage(
+            f"Solver thread started with {max_solvers} workers. Polling every {solve_interval / 60:.1f} minutes."
+        )
     )
-    while not stop_event.is_set():
-        tui_app.post_message(LogMessage("Checking for challenges to solve..."))
-        now = datetime.now(timezone.utc)
-        addresses = db_manager.get_addresses()
 
-        for address in addresses:
-            challenges = db_manager.get_challenge_queue(address)
-            for c in challenges:
-                if c["status"] == "available":
-                    latest_submission = datetime.fromisoformat(
-                        c["latestSubmission"].replace("Z", "+00:00")
-                    )
-                    if now > latest_submission:
-                        msg = f"Challenge {c['challengeId']} for {address[:10]}... has expired."
-                        tui_app.post_message(LogMessage(msg))
-                        updated_status = db_manager.update_challenge(
-                            address, c["challengeId"], {"status": "expired"}
-                        )
-                        if updated_status:
-                            tui_app.post_message(
-                                ChallengeUpdate(
-                                    address, c["challengeId"], updated_status
-                                )
-                            )
-                        continue
+    # The executor should live for the duration of the worker
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_solvers) as executor:
+        # Store futures for active tasks
+        active_futures = set()
+        last_logged_check_time = datetime.min.replace(
+            tzinfo=timezone.utc
+        )  # Initialize with timezone-aware datetime
 
-                    # Update UI to show we're trying to solve it
+        while not stop_event.is_set():
+            now = datetime.now(timezone.utc)
+            if (now - last_logged_check_time) >= timedelta(seconds=solve_interval):
+                tui_app.post_message(LogMessage("Checking for challenges to solve..."))
+                last_logged_check_time = now
+
+            # Clean up completed futures
+            done_futures = {f for f in active_futures if f.done()}
+            for f in done_futures:
+                active_futures.remove(f)
+
+            available_slots = max_solvers - len(active_futures)
+            if available_slots <= 0:
+                if last_logged_check_time == now:
                     tui_app.post_message(
-                        ChallengeUpdate(address, c["challengeId"], "solving")
+                        LogMessage(
+                            f"Solver pool full ({len(active_futures)}/{max_solvers}). Waiting for slots."
+                        )
                     )
-                    msg = f"Attempting to solve challenge {c['challengeId']} for {address[:10]}..."
-                    tui_app.post_message(LogMessage(msg))
 
-                    try:
-                        command = [
-                            RUST_SOLVER_PATH,
-                            "--address",
-                            address,
-                            "--challenge-id",
-                            c["challengeId"],
-                            "--difficulty",
-                            c["difficulty"],
-                            "--no-pre-mine",
-                            c["noPreMine"],
-                            "--latest-submission",
-                            c["latestSubmission"],
-                            "--no-pre-mine-hour",
-                            c["noPreMineHour"],
-                        ]
-                        process = subprocess.Popen(
-                            command,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                        )
+            challenges_dispatched_this_round = 0
+            if available_slots > 0:
+                addresses = db_manager.get_addresses()
+                now = datetime.now(timezone.utc)
+                should_break_outer_loop = False
 
-                        while process.poll() is None:
-                            if stop_event.is_set():
-                                process.terminate()
-                                tui_app.post_message(
-                                    LogMessage(
-                                        f"Solver for {c['challengeId']} terminated by shutdown."
-                                    )
-                                )
-                                return  # Exit worker thread
-                            stop_event.wait(0.2)  # Non-blocking wait
-
-                        stdout, stderr = process.communicate()
-
-                        if process.returncode != 0:
-                            raise subprocess.CalledProcessError(
-                                process.returncode,
-                                command,
-                                output=stdout,
-                                stderr=stderr,
+                for address in addresses:
+                    challenges = db_manager.get_challenge_queue(address)
+                    for c in challenges:
+                        if c["status"] == "available":
+                            latest_submission = datetime.fromisoformat(
+                                c["latestSubmission"].replace("Z", "+00:00")
                             )
-
-                        nonce = stdout.strip()
-                        solved_time = datetime.now(timezone.utc)
-                        tui_app.post_message(
-                            LogMessage(f"Found nonce: {nonce} for {c['challengeId']}")
-                        )
-
-                        submit_url = f"https://sm.midnight.gd/api/solution/{address}/{c['challengeId']}/{nonce}"
-                        submit_response = requests.post(submit_url)
-                        submit_response.raise_for_status()
-                        validated_time = datetime.now(timezone.utc)
-                        tui_app.post_message(
-                            LogMessage(
-                                f"Solution submitted successfully for {c['challengeId']}"
-                            )
-                        )
-
-                        try:
-                            submission_data = submit_response.json()
-                            crypto_receipt = submission_data.get("crypto_receipt")
-
-                            update = {}
-                            if crypto_receipt:
-                                update = {
-                                    "status": "validated",
-                                    "solvedAt": solved_time.isoformat(
-                                        timespec="milliseconds"
-                                    ).replace("+00:00", "Z"),
-                                    "submittedAt": solved_time.isoformat(
-                                        timespec="milliseconds"
-                                    ).replace("+00:00", "Z"),
-                                    "validatedAt": validated_time.isoformat(
-                                        timespec="milliseconds"
-                                    ).replace("+00:00", "Z"),
-                                    "salt": nonce,
-                                    "cryptoReceipt": crypto_receipt,
-                                }
-                                tui_app.post_message(
-                                    LogMessage(
-                                        f"Successfully validated challenge {c['challengeId']}"
-                                    )
+                            if now > latest_submission:
+                                # Expire challenge
+                                updated_status = db_manager.update_challenge(
+                                    address, c["challengeId"], {"status": "expired"}
                                 )
+                                if updated_status:
+                                    msg = f"Challenge {c['challengeId']} for {address[:10]}... has expired."
+                                    tui_app.post_message(LogMessage(msg))
+                                    tui_app.post_message(
+                                        ChallengeUpdate(
+                                            address, c["challengeId"], updated_status
+                                        )
+                                    )
                             else:
-                                update = {
-                                    "status": "solved",  # Submitted but not validated with receipt
-                                    "solvedAt": solved_time.isoformat(
-                                        timespec="milliseconds"
-                                    ).replace("+00:00", "Z"),
-                                    "salt": nonce,
-                                }
-                                tui_app.post_message(
-                                    LogMessage(
-                                        f"Submission for {c['challengeId']} OK but no crypto_receipt."
+                                if available_slots > 0:
+                                    # Claim the challenge by updating its status
+                                    # This update is protected by DatabaseManager's lock
+                                    updated_status = db_manager.update_challenge(
+                                        address, c["challengeId"], {"status": "solving"}
                                     )
-                                )
+                                    if updated_status:
+                                        tui_app.post_message(
+                                            ChallengeUpdate(
+                                                address,
+                                                c["challengeId"],
+                                                updated_status,
+                                            )
+                                        )
+                                        # Submit claimed challenge to the thread pool
+                                        future = executor.submit(
+                                            _solve_one_challenge,
+                                            db_manager,
+                                            tui_app,
+                                            stop_event,
+                                            address,
+                                            deepcopy(c),  # Pass a deepcopy
+                                        )
+                                        active_futures.add(future)
+                                        challenges_dispatched_this_round += 1
+                                        available_slots -= 1
+                                else:
+                                    # No more slots available in the current pass
+                                    should_break_outer_loop = True
+                                    break  # Exit inner challenge loop
+                    if should_break_outer_loop:
+                        break  # Exit outer address loop
 
-                            updated_status = db_manager.update_challenge(
-                                address, c["challengeId"], update
-                            )
-                            if updated_status:
-                                tui_app.post_message(
-                                    ChallengeUpdate(
-                                        address, c["challengeId"], updated_status
-                                    )
-                                )
-
-                        except json.JSONDecodeError:
-                            msg = f"Failed to decode submission response for {c['challengeId']}."
-                            tui_app.post_message(LogMessage(msg))
-                            update = {"status": "submission_error", "salt": nonce}
-                            updated_status = db_manager.update_challenge(
-                                address, c["challengeId"], update
-                            )
-                            if updated_status:
-                                tui_app.post_message(
-                                    ChallengeUpdate(
-                                        address, c["challengeId"], updated_status
-                                    )
-                                )
-
-                    except subprocess.CalledProcessError as e:
-                        msg = f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"
-                        tui_app.post_message(LogMessage(msg))
-                        # Revert status to available if solver fails
-                        tui_app.post_message(
-                            ChallengeUpdate(address, c["challengeId"], "available")
+                if challenges_dispatched_this_round > 0:
+                    tui_app.post_message(
+                        LogMessage(
+                            f"Dispatched {challenges_dispatched_this_round} new challenges. "
+                            f"{len(active_futures)} active solvers."
                         )
-                    except requests.exceptions.RequestException as e:  # ty: ignore
-                        msg = f"Error submitting solution for {c['challengeId']}: {e}"
-                        tui_app.post_message(LogMessage(msg))
-                        tui_app.post_message(
-                            ChallengeUpdate(address, c["challengeId"], "available")
-                        )
-                    except Exception as e:
-                        msg = f"An unexpected error occurred during solving: {e}"
-                        tui_app.post_message(LogMessage(msg))
-                        tui_app.post_message(
-                            ChallengeUpdate(address, c["challengeId"], "available")
-                        )
+                    )
+                elif len(active_futures) == 0 and challenges_dispatched_this_round == 0:
+                    tui_app.post_message(LogMessage("No available challenges found."))
 
-        stop_event.wait(interval)
+            # If all slots are full, wait for one future to complete, or a short timeout
+            if len(active_futures) >= max_solvers and active_futures:
+                # Wait for at least one task to complete or a short period if none are done quickly
+                concurrent.futures.wait(
+                    active_futures,
+                    timeout=1,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+            else:
+                # If there are available slots (or no active tasks),
+                # wait the full solve_interval before checking for *new* challenges again.
+                stop_event.wait(solve_interval)
+
     logging.info("Solver thread stopped.")
 
 
@@ -485,6 +579,7 @@ def run_orchestrator(args):
     worker_args = {
         "solve_interval": args.solve_interval,
         "save_interval": args.save_interval,
+        "max_solvers": args.max_solvers,
     }
 
     app = OrchestratorTUI(
@@ -508,6 +603,12 @@ def main():
     init_parser.add_argument("files", nargs="+", help="List of JSON files to import.")
 
     run_parser = subparsers.add_parser("run", help="Run the orchestrator with TUI.")
+    run_parser.add_argument(
+        "--max-solvers",
+        type=int,
+        default=4,  # A sensible default
+        help="Maximum number of concurrent solver processes to run (default: 4).",
+    )
     run_parser.add_argument(
         "--solve-interval",
         type=int,

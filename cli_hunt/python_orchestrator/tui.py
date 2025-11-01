@@ -194,8 +194,9 @@ class OrchestratorTUI(App):
     def run_solver_worker(self) -> None:
         """Runs the solver logic in a background thread."""
         solver_func = self.worker_functions["solver"]
-        interval = self.worker_args["solve_interval"]
-        solver_func(self.db_manager, self.stop_event, interval, self)
+        solve_interval = self.worker_args["solve_interval"]
+        max_solvers = self.worker_args["max_solvers"]
+        solver_func(self.db_manager, self.stop_event, solve_interval, self, max_solvers)
 
     @work(name="saver", group="workers", thread=True)
     def run_saver_worker(self) -> None:
