@@ -28,12 +28,12 @@ You will need the following installed on your system:
 
 ### Cloning the Repository
 
-First, clone the project repository to your local machine, and switch to the `piz` branch.
-This is a fork of the original repository from IOHK implementing the ashmaize mining function.
-Then move into the `cli_hunt` subfolder where I added this tool.
+First, clone the project repository to your local machine, move into the directory and switch to the `piz` branch.
+This is a fork of the [original repository](https://github.com/input-output-hk/ce-ashmaize) from IOHK implementing the ashmaize mining function.
 
 ```bash
 git clone https://github.com/mpizenberg/ce-ashmaize.git
+cd ce-ashmaize
 git checkout piz
 cd cli_hunt
 ```
@@ -45,7 +45,7 @@ Navigate to the `rust_solver` directory and compile the optimized release binary
 ```bash
 cd rust_solver
 cargo build --release
-cd .. # Go back to the project root
+cd .. # Go back to the cli_hunt dir
 ```
 
 This will create an executable solver in `cli_hunt/rust_solver/target/release/`.
@@ -64,6 +64,11 @@ uv sync
 ### Initializing the Database
 
 Before you can run the orchestrator, you need to initialize its local database with information from your mining addresses. This information is obtained by exporting JSON metadata files from the Midnight Scavenger web application for each address you wish to manage. It's likely you'll need to register and solve at least one challenge on the website for each address to enable this export.
+
+```bash
+# from cli_hunt dir
+mkdir python_orchestrator/web/
+```
 
 Place all your exported JSON files into the `cli_hunt/python_orchestrator/web/` directory.
 
