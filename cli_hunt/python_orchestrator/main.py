@@ -18,8 +18,8 @@ LOG_FILE = "orchestrator.log"
 RUST_SOLVER_PATH = (
     "../rust_solver/target/release/ashmaize-solver"  # Assuming it's built
 )
-FETCH_INTERVAL = 15 * 60  # 15 minutes
-DEFAULT_SOLVE_INTERVAL = 30 * 60  # 30 minutes
+FETCH_INTERVAL = 10 * 60  # 15 minutes
+DEFAULT_SOLVE_INTERVAL = 10 * 60  # 10 minutes
 DEFAULT_SAVE_INTERVAL = 2 * 60  # 2 minutes
 
 
@@ -188,7 +188,7 @@ def fetcher_worker(db_manager, stop_event, tui_app):
             )
         else:
             try:
-                response = requests.get("https://sm.midnight.gd/api/challenge")
+                response = requests.get("https://scavenger.prod.gd.midnighttge.io/challenge")
                 response.raise_for_status()
                 challenge_data = response.json()["challenge"]
 
@@ -231,143 +231,105 @@ def fetcher_worker(db_manager, stop_event, tui_app):
 
 def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
     """Solves a single challenge."""
-    c = challenge  # for brevity
+    c = challenge
     msg = f"Attempting to solve challenge {c['challengeId']} for {address[:10]}..."
     tui_app.post_message(LogMessage(msg))
+
+    submit_response = None
+    crypto_receipt = None
 
     try:
         command = [
             RUST_SOLVER_PATH,
-            "--address",
-            address,
-            "--challenge-id",
-            c["challengeId"],
-            "--difficulty",
-            c["difficulty"],
-            "--no-pre-mine",
-            str(c["noPreMine"]),  # Convert boolean to string for subprocess
-            "--latest-submission",
-            c["latestSubmission"],
-            "--no-pre-mine-hour",
-            str(c["noPreMineHour"]),  # Convert to string for subprocess
+            "--address", address,
+            "--challenge-id", c["challengeId"],
+            "--difficulty", c["difficulty"],
+            "--no-pre-mine", str(c["noPreMine"]),
+            "--latest-submission", c["latestSubmission"],
+            "--no-pre-mine-hour", str(c["noPreMineHour"]),
         ]
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         while process.poll() is None:
             if stop_event.is_set():
                 process.terminate()
-                tui_app.post_message(
-                    LogMessage(f"Solver for {c['challengeId']} terminated by shutdown.")
-                )
-                # Revert status so it can be picked up again on restart
-                db_manager.update_challenge(
-                    address, c["challengeId"], {"status": "available"}
-                )
+                tui_app.post_message(LogMessage(f"Solver for {c['challengeId']} terminated by shutdown."))
+                db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
                 return
             stop_event.wait(0.2)
 
         stdout, stderr = process.communicate()
 
         if process.returncode != 0:
-            raise subprocess.CalledProcessError(
-                process.returncode,
-                command,
-                output=stdout,
-                stderr=stderr,
-            )
+            raise subprocess.CalledProcessError(process.returncode, command, output=stdout, stderr=stderr)
 
         nonce = stdout.strip()
         solved_time = datetime.now(timezone.utc)
         tui_app.post_message(LogMessage(f"Found nonce: {nonce} for {c['challengeId']}"))
 
-        submit_url = (
-            f"https://sm.midnight.gd/api/solution/{address}/{c['challengeId']}/{nonce}"
-        )
-        submit_response = requests.post(submit_url)
+        submit_url = f"https://scavenger.prod.gd.midnighttge.io/solution/{address}/{c['challengeId']}/{nonce}"
+        submit_response = requests.post(submit_url, json={})
+
+        # Handle "already exists" before raising errors
+        if submit_response.status_code == 400 and "Solution already exists" in submit_response.text:
+            tui_app.post_message(LogMessage(f"Solution for {c['challengeId']} already submitted."))
+            validated_time = datetime.now(timezone.utc)
+            __confirm_submission(db_manager, tui_app, address, c, crypto_receipt, solved_time, validated_time, nonce)
+            return
+
         submit_response.raise_for_status()
+
         validated_time = datetime.now(timezone.utc)
-        tui_app.post_message(
-            LogMessage(f"Solution submitted successfully for {c['challengeId']}")
-        )
+        tui_app.post_message(LogMessage(f"Solution submitted successfully for {c['challengeId']}"))
 
         try:
             submission_data = submit_response.json()
             crypto_receipt = submission_data.get("crypto_receipt")
-
-            update = {}
-            if crypto_receipt:
-                update = {
-                    "status": "validated",
-                    "solvedAt": solved_time.isoformat(timespec="milliseconds").replace(
-                        "+00:00", "Z"
-                    ),
-                    "submittedAt": solved_time.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
-                    "validatedAt": validated_time.isoformat(
-                        timespec="milliseconds"
-                    ).replace("+00:00", "Z"),
-                    "salt": nonce,
-                    "cryptoReceipt": crypto_receipt,
-                }
-                tui_app.post_message(
-                    LogMessage(f"Successfully validated challenge {c['challengeId']}")
-                )
-            else:
-                update = {
-                    "status": "solved",  # Submitted but not validated with receipt
-                    "solvedAt": solved_time.isoformat(timespec="milliseconds").replace(
-                        "+00:00", "Z"
-                    ),
-                    "salt": nonce,
-                }
-                tui_app.post_message(
-                    LogMessage(
-                        f"Submission for {c['challengeId']} OK but no crypto_receipt."
-                    )
-                )
-
-            updated_status = db_manager.update_challenge(
-                address, c["challengeId"], update
-            )
-            if updated_status:
-                tui_app.post_message(
-                    ChallengeUpdate(address, c["challengeId"], updated_status)
-                )
+            __confirm_submission(db_manager, tui_app, address, c, crypto_receipt, solved_time, validated_time, nonce)
 
         except json.JSONDecodeError:
             msg = f"Failed to decode submission response for {c['challengeId']}."
             tui_app.post_message(LogMessage(msg))
-            update = {"status": "submission_error", "salt": nonce}
-            updated_status = db_manager.update_challenge(
-                address, c["challengeId"], update
-            )
-            if updated_status:
-                tui_app.post_message(
-                    ChallengeUpdate(address, c["challengeId"], updated_status)
-                )
+            db_manager.update_challenge(address, c["challengeId"], {"status": "submission_error", "salt": nonce})
 
     except subprocess.CalledProcessError as e:
-        msg = f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"
-        tui_app.post_message(LogMessage(msg))
-        # Revert status to available if solver fails
+        tui_app.post_message(LogMessage(f"Rust solver error for {c['challengeId']}: {e.stderr.strip()}"))
         db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
-        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
-    except requests.exceptions.RequestException as e:  # ty: ignore
-        msg = f"Error submitting solution for {c['challengeId']}: {e}"
-        tui_app.post_message(LogMessage(msg))
+    except requests.exceptions.RequestException as e:
+        tui_app.post_message(LogMessage(f"Error submitting solution for {c['challengeId']}: {e}"))
+        if submit_response is not None:
+            tui_app.post_message(LogMessage(submit_response.text))
         db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
-        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
     except Exception as e:
-        msg = f"An unexpected error occurred during solving: {e}"
-        tui_app.post_message(LogMessage(msg))
+        tui_app.post_message(LogMessage(f"Unexpected error solving {c['challengeId']}: {e}"))
+        if submit_response is not None:
+            tui_app.post_message(LogMessage(submit_response.text))
         db_manager.update_challenge(address, c["challengeId"], {"status": "available"})
-        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], "available"))
+
+
+def __confirm_submission(db_manager, tui_app, address, c, crypto_receipt, solved_time, validated_time, nonce):
+    if crypto_receipt:
+        update = {
+            "status": "validated",
+            "solvedAt": solved_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "submittedAt": solved_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "validatedAt": validated_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "salt": nonce,
+            "cryptoReceipt": crypto_receipt,
+        }
+        tui_app.post_message(LogMessage(f"Successfully validated challenge {c['challengeId']}"))
+    else:
+        update = {
+            "status": "solved",
+            "solvedAt": solved_time.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "salt": nonce,
+        }
+        tui_app.post_message(LogMessage(f"Submission for {c['challengeId']} OK but no crypto_receipt."))
+
+    updated_status = db_manager.update_challenge(address, c["challengeId"], update)
+    if updated_status:
+        tui_app.post_message(ChallengeUpdate(address, c["challengeId"], updated_status))
 
 
 def solver_worker(db_manager, stop_event, solve_interval, tui_app, max_solvers):
@@ -606,7 +568,7 @@ def main():
     run_parser.add_argument(
         "--max-solvers",
         type=int,
-        default=4,  # A sensible default
+        default=14,  # A sensible default
         help="Maximum number of concurrent solver processes to run (default: 4).",
     )
     run_parser.add_argument(
