@@ -1,3 +1,4 @@
 /target
 Cargo.lock
 /cli_hunt/python_orchestrator/web/*.json
+/cli_hunt/donate_script/*.json
